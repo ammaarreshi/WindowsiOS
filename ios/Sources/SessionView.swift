@@ -359,6 +359,10 @@ struct SessionView: View {
                     vm.launchGuestAntigravity()
                 }
 
+                studioQuickTile(title: "Paint", icon: "paintbrush.pointed") {
+                    vm.launchGuestPaint()
+                }
+
                 studioQuickTile(title: "Edge Web", icon: "globe") {
                     vm.launchGuestEdgeBrowser()
                 }
@@ -457,6 +461,10 @@ struct SessionView: View {
 
                 studioPillItem(icon: "sparkles", label: "Antigravity") {
                     vm.launchGuestAntigravity()
+                }
+
+                studioPillItem(icon: "paintbrush.pointed", label: "Paint") {
+                    vm.launchGuestPaint()
                 }
 
                 studioPillItem(icon: "globe", label: "Edge") {

@@ -206,6 +206,20 @@ final class VMViewModel: ObservableObject {
         }
     }
 
+    func launchGuestPaint() {
+        // Win+R -> "mspaint" -> Enter
+        WinIOSBridge.shared.sendKeyCombo(withModifiers: [NSNumber(value: 0xe3)], key: 0x15)
+        DispatchQueue.main.asyncAfter(deadline: .now() + 0.42) {
+            // m s p a i n t Enter
+            let paintHids: [UInt8] = [0x10, 0x16, 0x13, 0x04, 0x0c, 0x11, 0x17, 0x28]
+            for (idx, code) in paintHids.enumerated() {
+                DispatchQueue.main.asyncAfter(deadline: .now() + Double(idx) * 0.042) {
+                    WinIOSBridge.shared.tapKeyHid(code)
+                }
+            }
+        }
+    }
+
     func syncFromBridge() {
         let b = WinIOSBridge.shared
         isJITLive = b.isJITLive
