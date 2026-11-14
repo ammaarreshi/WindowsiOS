@@ -328,7 +328,7 @@ struct SessionView: View {
     private func surfaceStudioFooterStrip(viewportSize: CGSize) -> some View {
         VStack(spacing: 10) {
             HStack {
-                Text("DEVICE_NAME = SURFACE_DUO_ULTRA")
+                Text("DEVICE = IPHONE AIR")
                     .font(.system(size: 9.5, weight: .medium, design: .monospaced))
                     .tracking(1.1)
                     .foregroundStyle(Color(red: 0.72, green: 0.80, blue: 0.95).opacity(0.55))
@@ -339,7 +339,7 @@ struct SessionView: View {
                     Circle()
                         .fill(vm.isJITLive ? Color.white.opacity(0.75) : Color.orange)
                         .frame(width: 4.5, height: 4.5)
-                    Text("WIN11 ARM64 · 4.5 GB")
+                    Text("WINDOWS 11 ARM64")
                         .font(.system(size: 9.5, weight: .medium, design: .monospaced))
                         .foregroundStyle(Color.white.opacity(0.45))
                 }
@@ -347,7 +347,7 @@ struct SessionView: View {
 
             // Quick Studio Action Strip for Portrait Open Mode
             HStack(spacing: 8) {
-                studioQuickTile(title: "Laptop Deck", icon: "laptopcomputer", prominent: true) {
+                studioQuickTile(title: "Split View", icon: "rectangle.split.2x1", prominent: true) {
                     withAnimation(.spring(response: 0.28, dampingFraction: 0.88)) {
                         vm.postureMode = .laptop
                         vm.systemKeyboardVisible = false
