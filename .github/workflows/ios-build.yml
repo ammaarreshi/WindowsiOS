@@ -1,0 +1,77 @@
+name: iOS build (iPhone Air experiment)
+
+on:
+  workflow_dispatch:
+  push:
+    branches:
+      - iphone-air
+    paths:
+      - "core/**"
+      - "devices/**"
+      - "host/**"
+      - "ios/**"
+      - "scripts/build_ios_deps.sh"
+      - "Makefile"
+      - ".github/workflows/ios-build.yml"
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    # Apple Silicon is required by the repository's dependency script.
+    runs-on: macos-15-arm64
+    timeout-minutes: 90
+
+    steps:
+      - name: Check out source
+        uses: actions/checkout@v4
+
+      - name: Show runner and Xcode
+        run: |
+          uname -a
+          test "$(uname -m)" = "arm64"
+          xcodebuild -version
+          xcrun --sdk iphoneos --show-sdk-version
+
+      - name: Install build tools
+        run: |
+          brew update
+          brew install meson ninja pkg-config xcodegen python@3.12
+          echo "/opt/homebrew/bin" >> "$GITHUB_PATH"
+
+      - name: Build iOS dependencies
+        env:
+          # Husk is not part of this repository. Its optional local patch/framework
+          # is deliberately skipped on the hosted runner rather than using an author's path.
+          HUSK_REF: /tmp/windowsios-no-husk
+        run: |
+          chmod +x scripts/build_ios_deps.sh
+          ./scripts/build_ios_deps.sh
+
+      - name: Build the iOS static library
+        run: |
+          make ios-lib
+
+      - name: Generate Xcode project
+        run: |
+          xcodegen generate --spec ios/project.yml
+
+      - name: Compile unsigned iOS app
+        run: |
+          xcodebuild \
+            -project ios/WindowsiOS.xcodeproj \
+            -scheme WindowsiOS \
+            -configuration Release \
+            -sdk iphoneos \
+            -derivedDataPath build/DerivedData \
+            CODE_SIGNING_ALLOWED=NO \
+            build
+
+      - name: Upload unsigned app
+        uses: actions/upload-artifact@v4
+        with:
+          name: WindowsiOS-unsigned-iphoneos
+          path: build/DerivedData/Build/Products/Release-iphoneos/WindowsiOS.app
+          if-no-files-found: error
+          retention-days: 7
