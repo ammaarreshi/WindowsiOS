@@ -14,6 +14,8 @@ final class MetalCanvasUIView: UIView, UIKeyInput {
     var onThreeFingerTap: (() -> Void)?
 
     private var activeDragButtons: UInt8 = 0
+    /// Buttons held by a trackpad or mouse (indirect pointer touches), which go to Windows without gestures.
+    private var pointerButtons: UInt8 = 0
     private var panLastPoint: CGPoint = .zero
     private var scrollAccum: CGFloat = 0
     private let tapHaptic = UIImpactFeedbackGenerator(style: .light)
@@ -73,6 +75,22 @@ final class MetalCanvasUIView: UIView, UIKeyInput {
             let hover = UIHoverGestureRecognizer(target: self, action: #selector(handleHover(_:)))
             addGestureRecognizer(hover)
         }
+
+        // Windows draws its own pointer where the iPad's would be (absolute tablet), so the iPad's
+        // pointer is hidden over the screen instead of sitting on top of it.
+        addInteraction(UIPointerInteraction(delegate: self))
+
+        // The tap, drag and press gestures are for fingers only. A trackpad or mouse button goes straight
+        // to Windows (touchesBegan below): through the pan gesture it pressed only after the pointer had
+        // moved about 10 pt, so window edges could not be grabbed and drags started late. The scroll pan
+        // keeps every touch type, so trackpad and mouse-wheel scrolling still reach it.
+        let fingers = [
+            NSNumber(value: UITouch.TouchType.direct.rawValue),
+            NSNumber(value: UITouch.TouchType.pencil.rawValue),
+        ]
+        for gr in [singleTap, twoFingerTap, threeFingerTap, dragPan, longPress] as [UIGestureRecognizer] {
+            gr.allowedTouchTypes = fingers
+        }
     }
 
     override func didMoveToWindow() {
@@ -80,6 +98,7 @@ final class MetalCanvasUIView: UIView, UIKeyInput {
         updateDrawableScale()
         if window != nil {
             WinIOSBridge.shared.bindMetalLayer(metalLayer)
+            DispatchQueue.main.async { [weak self] in self?.keepKeyboardFocus() }
         }
     }
 
@@ -121,6 +140,52 @@ final class MetalCanvasUIView: UIView, UIKeyInput {
         let nx = min(1.0, max(0.0, Double((pt.x - rect.minX) / max(1.0, rect.width))))
         let ny = min(1.0, max(0.0, Double((pt.y - rect.minY) / max(1.0, rect.height))))
         return (nx, ny)
+    }
+
+    private func pointerMask(_ event: UIEvent?) -> UInt8 {
+        if rightClickArmed {
+            rightClickArmed = false
+            onRightClickConsumed?()
+            return 2
+        }
+        if let event, event.buttonMask.contains(.secondary) { return 2 }
+        return 1
+    }
+
+    override func touchesBegan(_ touches: Set<UITouch>, with event: UIEvent?) {
+        keepKeyboardFocus()
+        guard let t = touches.first(where: { $0.type == .indirectPointer }) else {
+            return super.touchesBegan(touches, with: event)
+        }
+        pointerButtons = pointerMask(event)
+        let (nx, ny) = normalizedPoint(for: t.location(in: self))
+        PointerController.shared.moveAbsolute(x: nx, y: ny, extraButtons: pointerButtons)
+    }
+
+    override func touchesMoved(_ touches: Set<UITouch>, with event: UIEvent?) {
+        guard let t = touches.first(where: { $0.type == .indirectPointer }) else {
+            return super.touchesMoved(touches, with: event)
+        }
+        let (nx, ny) = normalizedPoint(for: t.location(in: self))
+        PointerController.shared.moveAbsolute(x: nx, y: ny, extraButtons: pointerButtons)
+    }
+
+    override func touchesEnded(_ touches: Set<UITouch>, with event: UIEvent?) {
+        guard let t = touches.first(where: { $0.type == .indirectPointer }) else {
+            return super.touchesEnded(touches, with: event)
+        }
+        pointerButtons = 0
+        let (nx, ny) = normalizedPoint(for: t.location(in: self))
+        PointerController.shared.moveAbsolute(x: nx, y: ny, extraButtons: 0)
+    }
+
+    override func touchesCancelled(_ touches: Set<UITouch>, with event: UIEvent?) {
+        guard touches.contains(where: { $0.type == .indirectPointer }) else {
+            return super.touchesCancelled(touches, with: event)
+        }
+        pointerButtons = 0
+        let pc = PointerController.shared
+        pc.moveAbsolute(x: pc.cursorX, y: pc.cursorY, extraButtons: 0)
     }
 
     @objc private func handleSingleTap(_ gr: UITapGestureRecognizer) {
@@ -226,12 +291,36 @@ final class MetalCanvasUIView: UIView, UIKeyInput {
 
     @objc private func handleHover(_ gr: UIHoverGestureRecognizer) {
         let (nx, ny) = normalizedPoint(for: gr.location(in: self))
-        PointerController.shared.moveAbsolute(x: nx, y: ny, extraButtons: activeDragButtons)
+        PointerController.shared.moveAbsolute(x: nx, y: ny, extraButtons: activeDragButtons | pointerButtons)
     }
 
     // MARK: - Software & Hardware Keyboard (USB HID Page 0x07)
 
     override var canBecomeFirstResponder: Bool { true }
+
+    // The screen keeps keyboard focus, so a hardware keyboard (Magic Keyboard) always types into Windows.
+    // The on-screen keyboard shows only when asked for (Keys); otherwise an empty input view stands in for
+    // it and the shortcut bar is cleared. Focus is taken when the view appears, on a touch or click, and
+    // when Keys changes, never while something is presented over the app (a sign-in sheet's fields keep it).
+    var softKeyboardWanted = false {
+        didSet {
+            guard softKeyboardWanted != oldValue else { return }
+            if isFirstResponder {
+                reloadInputViews()
+            } else {
+                DispatchQueue.main.async { [weak self] in self?.keepKeyboardFocus() }
+            }
+        }
+    }
+    private let noSoftKeyboard = UIView(frame: .zero)
+    override var inputView: UIView? { softKeyboardWanted ? nil : noSoftKeyboard }
+    func keepKeyboardFocus() {
+        guard window != nil, !isFirstResponder,
+              window?.rootViewController?.presentedViewController == nil else { return }
+        inputAssistantItem.leadingBarButtonGroups = []
+        inputAssistantItem.trailingBarButtonGroups = []
+        _ = becomeFirstResponder()
+    }
     var hasText: Bool { true }
 
     func insertText(_ text: String) {
@@ -332,10 +421,15 @@ struct MetalDisplayView: UIViewRepresentable {
         uiView.trackpadMode = trackpadMode
         uiView.rightClickArmed = rightClickArmed
         uiView.onThreeFingerTap = onThreeFingerTap
-        if keyboardVisible && !uiView.isFirstResponder {
-            DispatchQueue.main.async { _ = uiView.becomeFirstResponder() }
-        } else if !keyboardVisible && uiView.isFirstResponder {
-            DispatchQueue.main.async { _ = uiView.resignFirstResponder() }
-        }
+        // Keys only shows or hides the on-screen keyboard; keyboard focus stays on the screen.
+        uiView.softKeyboardWanted = keyboardVisible
+    }
+}
+
+// Hide the iPad pointer over the Windows screen; Windows' own pointer follows it exactly.
+extension MetalCanvasUIView: UIPointerInteractionDelegate {
+    func pointerInteraction(_ interaction: UIPointerInteraction,
+                            styleFor region: UIPointerRegion) -> UIPointerStyle? {
+        UIPointerStyle.hidden()
     }
 }
