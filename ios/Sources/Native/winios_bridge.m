@@ -11,6 +11,7 @@
 #include <mach/mach_time.h>
 #include <os/lock.h>
 #include <sys/stat.h>
+#include <sys/sysctl.h>
 
 static WinIOSBridge *s_shared_bridge = nil;
 
@@ -123,6 +124,28 @@ static void unpack_progress_cb(uint64_t done, uint64_t total, void *opaque) {
             }
         }];
     }
+}
+
+/* Windows shows the real device: the firmware tables (SMBIOS, devices/acpi.c) take the machine name, model and
+ * processor from these variables. The iPhone Duo keeps the tables' own strings; other devices show their model
+ * identifier. */
+- (void)setDeviceIdentityForFirmware {
+    char machine[64] = {0};
+    size_t len = sizeof machine - 1;
+    sysctlbyname("hw.machine", machine, &len, NULL, 0);
+    NSString *m = [NSString stringWithUTF8String:machine];
+    if ([m isEqualToString:@"iPhone19,4"]) return; /* the iPhone Duo: devices/acpi.c's defaults describe it */
+    NSString *product = m, *cpu = @"Apple silicon";
+    int mhz = 4000;
+    if ([m isEqualToString:@"iPad16,3"] || [m isEqualToString:@"iPad16,4"]) {
+        product = @"iPad Pro 11-inch (M4)"; cpu = @"Apple M4"; mhz = 4400;
+    } else if ([m isEqualToString:@"iPad16,5"] || [m isEqualToString:@"iPad16,6"]) {
+        product = @"iPad Pro 13-inch (M4)"; cpu = @"Apple M4"; mhz = 4400;
+    }
+    setenv("HV_SMBIOS_PRODUCT", product.UTF8String, 1);
+    setenv("HV_SMBIOS_MODEL", machine, 1);
+    setenv("HV_SMBIOS_CPU", cpu.UTF8String, 1);
+    setenv("HV_SMBIOS_CPU_MHZ", [NSString stringWithFormat:@"%d", mhz].UTF8String, 1);
 }
 
 - (void)onAudioInterruption:(NSNotification *)note {
@@ -406,6 +429,7 @@ static void unpack_progress_cb(uint64_t done, uint64_t total, void *opaque) {
 
     _configuredRamMB = ramMB;
     _configuredCPUs = 4;
+    [self setDeviceIdentityForFirmware];
 
     HvWinVmConfig cfg = {
         .code_fd = codePath.fileSystemRepresentation,
