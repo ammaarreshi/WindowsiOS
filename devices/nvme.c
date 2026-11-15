@@ -157,7 +157,7 @@ static uint16_t handle_identify(HvNvme *nv, const NvmeCmd *cmd) {
         buf[24] = 0;                  /* NSFEAT */
         buf[25] = 0;                  /* NLBAF = 0 (1 format) */
         buf[26] = 0;                  /* FLBAS = format 0 */
-        buf[33] = 0x08;               /* DLFEAT: read bytes from deallocated blocks are 0 */
+        buf[33] = 0x08;               /* DLFEAT: Write Zeroes may deallocate; read value not reported */
         /* LBAF 0 at byte 128: MS=0, LBADS=9 (2^9 = 512 bytes), RP=0 */
         buf[130] = 9;
     } else if (cns == 0x01) { /* Identify Controller */
@@ -426,21 +426,36 @@ static void process_io_cmd(HvNvme *nv, HvNvmeSq *sq, uint16_t sqid, const NvmeCm
             status = 0x0080;
             break;
         }
-        uint8_t zero[4096] = {0};
-        while (bytes > 0) {
-            uint32_t chunk = bytes < sizeof(zero) ? bytes : (uint32_t)sizeof(zero);
-            if (hv_disk_write(nv->disk, off, zero, chunk) != 0) {
+        /* Zeros through hv_disk_discard, which punches holes for whole blocks instead of writing them, so
+           zeroing gives the space back to the host. */
+        if (hv_disk_discard(nv->disk, off, bytes, 1) != 0) status = 0x0004;
+        break;
+    }
+    case 0x09: { /* Dataset Management (TRIM / Deallocate) */
+        /* Each range is deallocated for real: its whole 4 KB blocks become holes in the image file, so space
+           Windows frees is freed on the host too. What deallocated blocks read is not reported (DLFEAT), so the
+           partial blocks at the edges keep their data and nothing is written: a ReTrim never stalls the guest. */
+        uint32_t nr = (cmd->cdw10 & 0xffu) + 1u;
+        if (!(cmd->cdw11 & (1u << 2))) break; /* only the Integral Dataset hints: nothing to do */
+        struct { uint32_t attr, nlb; uint64_t slba; } ranges[256];
+        if (nvme_dma_prp(nv, cmd->prp1, cmd->prp2, ranges, nr * 16u, 0) != 0) {
+            status = 0x0004;
+            break;
+        }
+        for (uint32_t i = 0; i < nr; i++) {
+            uint64_t off = ranges[i].slba * 512ull, bytes = (uint64_t)ranges[i].nlb * 512ull;
+            if (!bytes) continue;
+            if (ranges[i].slba > nv->disk->size / 512ull || off + bytes > nv->disk->size) {
+                status = 0x0080; /* LBA Out of Range */
+                break;
+            }
+            if (hv_disk_discard(nv->disk, off, bytes, 0) != 0) {
                 status = 0x0004;
                 break;
             }
-            off += chunk;
-            bytes -= chunk;
         }
         break;
     }
-    case 0x09: /* Dataset Management (TRIM / Deallocate) */
-        status = 0;
-        break;
     default:
         status = 0x0001; /* Invalid Command Opcode */
         break;
