@@ -108,6 +108,10 @@ static void unpack_progress_cb(uint64_t done, uint64_t total, void *opaque) {
         /* Fallback to Playback if PlayAndRecord temporarily rejected before permission */
         [session setCategory:AVAudioSessionCategoryPlayback withOptions:AVAudioSessionCategoryOptionMixWithOthers error:nil];
     }
+    /* iOS mutes haptics while an app records, and Windows keeps the microphone stream open, so the deck keys and
+     * trackpad mostly gave no tick. Haptics stay on while recording (the user's System Haptics setting still
+     * applies). */
+    [session setAllowHapticsAndSystemSoundsDuringRecording:YES error:nil];
     [session setPreferredSampleRate:48000.0 error:nil];
     [session setPreferredIOBufferDuration:0.010 error:nil];
     [session setActive:YES error:nil];
@@ -118,6 +122,7 @@ static void unpack_progress_cb(uint64_t done, uint64_t total, void *opaque) {
                 dispatch_async(dispatch_get_main_queue(), ^{
                     AVAudioSession *s = [AVAudioSession sharedInstance];
                     [s setCategory:AVAudioSessionCategoryPlayAndRecord mode:AVAudioSessionModeDefault options:opts error:nil];
+                    [s setAllowHapticsAndSystemSoundsDuringRecording:YES error:nil];
                     [s setActive:YES error:nil];
                 });
             }
