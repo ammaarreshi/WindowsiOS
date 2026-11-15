@@ -8,7 +8,17 @@ final class MetalCanvasUIView: UIView, UIKeyInput {
     override class var layerClass: AnyClass { CAMetalLayer.self }
 
     var metalLayer: CAMetalLayer { layer as! CAMetalLayer }
-    var trackpadMode: Bool = false
+    var trackpadMode: Bool = false {
+        didSet {
+            guard trackpadMode != oldValue else { return }
+            if trackpadMode {
+                setNeedsLayout() // the first-time hint shows from layoutSubviews, once the view has a size
+            } else {
+                stopGlide()
+                endHold()
+            }
+        }
+    }
     var rightClickArmed: Bool = false
     var onRightClickConsumed: (() -> Void)?
     var onThreeFingerTap: (() -> Void)?
@@ -17,6 +27,15 @@ final class MetalCanvasUIView: UIView, UIKeyInput {
     private var panLastPoint: CGPoint = .zero
     private var scrollAccum: CGFloat = 0
     private let tapHaptic = UIImpactFeedbackGenerator(style: .light)
+    /// Trackpad mode, as in UTM: a held press drags with the left button, and a flick glides on.
+    private var dragLastPoint: CGPoint = .zero
+    private var dragHeld = false
+    private var glideVelocity: CGPoint = .zero
+    private var glideLastTime: CFTimeInterval = 0
+    private var glideLink: CADisplayLink?
+    /// The finger trackpad moves the pointer this much faster than the laptop deck's, which felt
+    /// sluggish over a whole screen.
+    private let trackpadBoost: Double = 1.6
 
     override init(frame: CGRect) {
         super.init(frame: frame)
@@ -65,8 +84,10 @@ final class MetalCanvasUIView: UIView, UIKeyInput {
         addGestureRecognizer(scrollPan)
 
         let longPress = UILongPressGestureRecognizer(target: self, action: #selector(handleLongPress(_:)))
-        longPress.minimumPressDuration = 0.45
-        longPress.allowableMovement = 12
+        // Half a second held still (8 pt), as in UTM: a finger that hesitates before moving stays a
+        // pointer move.
+        longPress.minimumPressDuration = 0.5
+        longPress.allowableMovement = 8
         addGestureRecognizer(longPress)
 
         if #available(iOS 13.4, *) {
@@ -86,6 +107,7 @@ final class MetalCanvasUIView: UIView, UIKeyInput {
     override func layoutSubviews() {
         super.layoutSubviews()
         updateDrawableScale()
+        if trackpadMode && window != nil && bounds.width > 0 { showTrackpadHintOnce() }
     }
 
     private func updateDrawableScale() {
@@ -125,6 +147,7 @@ final class MetalCanvasUIView: UIView, UIKeyInput {
 
     @objc private func handleSingleTap(_ gr: UITapGestureRecognizer) {
         guard gr.state == .ended else { return }
+        stopGlide()
         tapHaptic.impactOccurred(intensity: 0.45)
         let mask: UInt8
         if rightClickArmed {
@@ -155,14 +178,118 @@ final class MetalCanvasUIView: UIView, UIKeyInput {
     }
 
     @objc private func handleLongPress(_ gr: UILongPressGestureRecognizer) {
+        // A held drag ends with the gesture, or when trackpad mode is switched off in the middle of it.
+        let over = gr.state == .ended || gr.state == .cancelled || gr.state == .failed
+        if dragHeld && (!trackpadMode || over) {
+            endHold()
+            return
+        }
+        if trackpadMode {
+            // As UTM's trackpad: hold, then move = a left-button drag (files, windows, a selection).
+            // Right click stays a two-finger tap.
+            let loc = gr.location(in: self)
+            switch gr.state {
+            case .began:
+                stopGlide()
+                UIImpactFeedbackGenerator(style: .medium).impactOccurred()
+                dragLastPoint = loc
+                dragHeld = true
+                PointerController.shared.setHeldButton(1, down: true)
+                showPressRing(at: loc)
+            case .changed:
+                guard dragHeld else { return }
+                PointerController.shared.moveRelative(
+                    dxPoints: loc.x - dragLastPoint.x, dyPoints: loc.y - dragLastPoint.y,
+                    padWidth: bounds.width, padHeight: bounds.height, boost: trackpadBoost)
+                dragLastPoint = loc
+            default:
+                break
+            }
+            return
+        }
         guard gr.state == .began else { return }
         UIImpactFeedbackGenerator(style: .medium).impactOccurred()
-        if trackpadMode {
-            PointerController.shared.clickAtCurrent(buttonMask: 2)
-        } else {
-            let (nx, ny) = normalizedPoint(for: gr.location(in: self))
-            PointerController.shared.directTapAt(x: nx, y: ny, buttonMask: 2)
-        }
+        let (nx, ny) = normalizedPoint(for: gr.location(in: self))
+        PointerController.shared.directTapAt(x: nx, y: ny, buttonMask: 2)
+    }
+
+    private func endHold() {
+        guard dragHeld else { return }
+        dragHeld = false
+        PointerController.shared.setHeldButton(1, down: false)
+        UIImpactFeedbackGenerator(style: .light).impactOccurred(intensity: 0.5)
+    }
+
+    private func showPressRing(at point: CGPoint) {
+        let ring = UIView(frame: CGRect(x: 0, y: 0, width: 64, height: 64))
+        ring.center = point
+        ring.isUserInteractionEnabled = false
+        ring.layer.cornerRadius = 32
+        ring.layer.borderWidth = 3
+        ring.layer.borderColor = UIColor.white.withAlphaComponent(0.85).cgColor
+        addSubview(ring)
+        UIView.animate(withDuration: 0.45, delay: 0.1, options: [.curveEaseOut]) {
+            ring.transform = CGAffineTransform(scaleX: 0.6, y: 0.6)
+            ring.alpha = 0
+        } completion: { _ in ring.removeFromSuperview() }
+    }
+
+    private func startGlide(_ velocity: CGPoint) {
+        stopGlide()
+        guard hypot(velocity.x, velocity.y) > 350 else { return }
+        glideVelocity = velocity
+        glideLastTime = CACurrentMediaTime()
+        let link = CADisplayLink(target: self, selector: #selector(glideStep))
+        link.add(to: .main, forMode: .common)
+        glideLink = link
+    }
+
+    @objc private func glideStep() {
+        let now = CACurrentMediaTime()
+        let dt = now - glideLastTime
+        glideLastTime = now
+        let decay = exp(-dt / 0.11)
+        glideVelocity = CGPoint(x: glideVelocity.x * decay, y: glideVelocity.y * decay)
+        if hypot(glideVelocity.x, glideVelocity.y) < 40 { stopGlide(); return }
+        PointerController.shared.moveRelative(
+            dxPoints: glideVelocity.x * dt, dyPoints: glideVelocity.y * dt,
+            padWidth: bounds.width, padHeight: bounds.height, boost: trackpadBoost)
+    }
+
+    private func stopGlide() {
+        glideLink?.invalidate()
+        glideLink = nil
+    }
+
+    /// The trackpad's gestures cannot be seen, so they are shown once, the first time trackpad mode
+    /// appears on a laid-out screen.
+    private func showTrackpadHintOnce() {
+        let key = "winios.trackpadHintShown"
+        guard !UserDefaults.standard.bool(forKey: key) else { return }
+        let label = UILabel()
+        label.text = [
+            "Trackpad mode",
+            "One finger moves the pointer · tap = click · hold ½ s, then move = drag",
+            "Two-finger tap = right click · two-finger swipe = scroll",
+            "(Trackpad / Touch in the toolbar switches)",
+        ].joined(separator: "\n")
+        label.numberOfLines = 0
+        label.textAlignment = .center
+        label.font = .systemFont(ofSize: 14, weight: .medium)
+        label.textColor = .white
+        label.backgroundColor = UIColor.black.withAlphaComponent(0.72)
+        label.layer.cornerRadius = 14
+        label.layer.masksToBounds = true
+        label.isUserInteractionEnabled = false
+        label.autoresizingMask = [.flexibleLeftMargin, .flexibleRightMargin]
+        let width = min(bounds.width - 24, 420)
+        let size = label.sizeThatFits(CGSize(width: width - 24, height: .greatestFiniteMagnitude))
+        label.frame = CGRect(x: (bounds.width - width) / 2, y: 16, width: width, height: size.height + 24)
+        addSubview(label)
+        UserDefaults.standard.set(true, forKey: key)
+        UIView.animate(withDuration: 0.5, delay: 8, options: []) {
+            label.alpha = 0
+        } completion: { _ in label.removeFromSuperview() }
     }
 
     @objc private func handleOneFingerPan(_ gr: UIPanGestureRecognizer) {
@@ -170,6 +297,7 @@ final class MetalCanvasUIView: UIView, UIKeyInput {
         switch gr.state {
         case .began:
             panLastPoint = loc
+            stopGlide()
             if !trackpadMode {
                 let (nx, ny) = normalizedPoint(for: loc)
                 activeDragButtons = rightClickArmed ? 2 : 1
@@ -189,13 +317,15 @@ final class MetalCanvasUIView: UIView, UIKeyInput {
                     dyPoints: dy,
                     padWidth: bounds.width,
                     padHeight: bounds.height,
-                    extraButtons: activeDragButtons
+                    extraButtons: activeDragButtons,
+                    boost: trackpadBoost
                 )
             } else {
                 let (nx, ny) = normalizedPoint(for: loc)
                 PointerController.shared.moveAbsolute(x: nx, y: ny, extraButtons: activeDragButtons)
             }
         case .ended, .cancelled, .failed:
+            if trackpadMode && gr.state == .ended { startGlide(gr.velocity(in: self)) }
             if activeDragButtons != 0 {
                 activeDragButtons = 0
                 PointerController.shared.moveAbsolute(
